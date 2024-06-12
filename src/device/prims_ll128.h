@@ -431,4 +431,9 @@ public:
   __device__ void recvReduceCopySend(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
     return GenericOp<1, 1, Input, Output>(inpIx, outIx, eltN, postOp);
   }
+
+  // localBuff -> output and input -> remoteBuff
+  __device__ __forceinline__ void recvCopySendV2(intptr_t inpIx, intptr_t outIx, int eltN, bool postOp=false) {
+    return GenericOp<1, 1, Input, Output>(inpIx, outIx, eltN, postOp);
+  }
 };

@@ -14,7 +14,7 @@
 #include <cstdint>
 
 #include <cuda_runtime.h>
-
+static constexpr int FusedSendRecv = 1;
 // Define min for ssize_t
 inline __device__ int min(int a, ssize_t b) { return (a < b) ? a : b; }
 
@@ -27,7 +27,7 @@ inline __device__ int loadInt(int* ptr) {
 
 template<typename RedFn, typename T, int Unroll, int BytePerPack,
          int MultimemSrcs, int MinSrcs, int MaxSrcs,
-         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
+         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs, int Export,
          typename IntBytes, typename SrcPtrFn, typename DstPtrFn>
 __device__ __forceinline__ void reduceCopyPacks(
     int nThreads, int &thread,
@@ -75,6 +75,7 @@ __device__ __forceinline__ void reduceCopyPacks(
   // can be handled or not.
   while (Unroll==1 ? (BytePerPack <= threadBytesAhead) : (0 < nHunksAhead)) {
     BytePack<BytePerPack> acc[Unroll];
+    BytePack<BytePerPack> accExport[Unroll];
 
     { RedFn preFn(0 < PreOpSrcs ? preOpArgs[0] : 0);
       #pragma unroll Unroll
@@ -102,14 +103,20 @@ __device__ __forceinline__ void reduceCopyPacks(
           acc[u] = applyLoadMultimem<RedFn, BytePerPack>(redFn, minSrcs[s]);
         } else {
           // Use volatile loads in case credits are polled for with volatile (instead of acquire).
-          tmp[u] = ld_volatile_global<BytePerPack>(minSrcs[s]);
+          if (Export == FusedSendRecv) {
+            accExport[u] = ld_volatile_global<BytePerPack>(minSrcs[s]);
+          } else {
+            tmp[u] = ld_volatile_global<BytePerPack>(minSrcs[s]);
+          }
         }
         minSrcs[s] += WARP_SIZE*BytePerPack;
       }
-      #pragma unroll Unroll
-      for (int u=0; u < Unroll; u++) {
-        if (s < PreOpSrcs) tmp[u] = applyPreOp(preFn, tmp[u]);
-        acc[u] = applyReduce(redFn, acc[u], tmp[u]);
+      if (Export == 0) {
+        #pragma unroll Unroll
+        for (int u=0; u < Unroll; u++) {
+          if (s < PreOpSrcs) tmp[u] = applyPreOp(preFn, tmp[u]);
+          acc[u] = applyReduce(redFn, acc[u], tmp[u]);
+        }
       }
     }
 
@@ -130,22 +137,31 @@ __device__ __forceinline__ void reduceCopyPacks(
       }
     }
 
-    if (postOp) {
+    if (Export == 0 && postOp) {
       #pragma unroll Unroll
       for (int u=0; u < Unroll; u++)
         acc[u] = applyPostOp(redFn, acc[u]);
     }
-
-    #pragma unroll (MinDsts + !MinDsts)
-    for (int d=0; d < MinDsts; d++) {
+    if (Export == FusedSendRecv) {
       #pragma unroll Unroll
       for (int u=0; u < Unroll; u++) {
-        if (d < MultimemDsts) {
-          multimem_st_global(minDsts[d], acc[u]);
-        } else {
-          st_global<BytePerPack>(minDsts[d], acc[u]);
+        st_global<BytePerPack>(minDsts[0], accExport[u]);
+        st_global<BytePerPack>(minDsts[1], acc[u]);
+        minDsts[0] += WARP_SIZE*BytePerPack;
+        minDsts[1] += WARP_SIZE*BytePerPack;
+      }
+    } else {
+      #pragma unroll (MinDsts + !MinDsts)
+      for (int d=0; d < MinDsts; d++) {
+        #pragma unroll Unroll
+        for (int u=0; u < Unroll; u++) {
+          if (d < MultimemDsts) {
+            multimem_st_global(minDsts[d], acc[u]);
+          } else {
+            st_global<BytePerPack>(minDsts[d], acc[u]);
+          }
+          minDsts[d] += WARP_SIZE*BytePerPack;
         }
-        minDsts[d] += WARP_SIZE*BytePerPack;
       }
     }
     for (int d=MinDsts; (MinDsts < MaxDsts) && (d < MaxDsts) && (d < nDsts); d++) {
@@ -182,7 +198,7 @@ __device__ __forceinline__ void reduceCopyPacks(
 
 template<int Unroll, typename RedFn, typename T,
          int MultimemSrcs, int MinSrcs, int MaxSrcs,
-         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
+         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs, int Export=0,
          typename IntBytes, typename SrcPtrFn, typename DstPtrFn>
 __device__ __forceinline__ void reduceCopy(
     int thread, int nThreads,
@@ -216,13 +232,13 @@ __device__ __forceinline__ void reduceCopy(
     aligned = __all_sync(~0u, aligned);
     if (aligned) {
       reduceCopyPacks<RedFn, T, Unroll, BigPackSize,
-        MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+        MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs, Export>
         (nThreads, /*&*/thread, redArg, preOpArgs, postOp,
          nSrcs, srcPtrFn, nDsts, dstPtrFn, /*&*/nBytesBehind, /*&*/nBytesAhead);
       if (nBytesAhead == 0) return;
 
       reduceCopyPacks<RedFn, T, /*Unroll=*/1, BigPackSize,
-        MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+        MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs, Export>
         (nThreads, /*&*/thread, redArg, preOpArgs, postOp,
          nSrcs, srcPtrFn, nDsts, dstPtrFn, /*&*/nBytesBehind, /*&*/nBytesAhead);
       if (nBytesAhead == 0) return;
@@ -230,20 +246,20 @@ __device__ __forceinline__ void reduceCopy(
   }
 
   reduceCopyPacks<RedFn, T, Unroll*(16/sizeof(T))/2, /*BytePerPack=*/sizeof(T),
-    MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+    MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs, Export>
     (nThreads, /*&*/thread, redArg, preOpArgs, postOp,
      nSrcs, srcPtrFn, nDsts, dstPtrFn, /*&*/nBytesBehind, /*&*/nBytesAhead);
   if (nBytesAhead == 0) return;
 
   reduceCopyPacks<RedFn, T, /*Unroll=*/1, /*BytePerPack=*/sizeof(T),
-    MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs>
+    MultimemSrcs, MinSrcs, MaxSrcs, MultimemDsts, MinDsts, MaxDsts, PreOpSrcs, Export>
     (nThreads, /*&*/thread, redArg, preOpArgs, postOp,
      nSrcs, srcPtrFn, nDsts, dstPtrFn, /*&*/nBytesBehind, /*&*/nBytesAhead);
 }
 
 template<int Unroll, typename RedFn, typename T,
          int MultimemSrcs, int MinSrcs, int MaxSrcs,
-         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs,
+         int MultimemDsts, int MinDsts, int MaxDsts, int PreOpSrcs, int Export=0,
          typename IntBytes>
 __device__ __forceinline__ void reduceCopy(
     int thread, int nThreads,
@@ -253,7 +269,7 @@ __device__ __forceinline__ void reduceCopy(
   ) {
   reduceCopy<Unroll, RedFn, T,
              MultimemSrcs, MinSrcs, MaxSrcs,
-             MultimemDsts, MinDsts, MaxDsts, PreOpSrcs, IntBytes>
+             MultimemDsts, MinDsts, MaxDsts, PreOpSrcs, Export, IntBytes>
     (thread, nThreads, redArg, preOpArgs, postOp,
      nSrcs, [=]__device__(int i) { return srcPtrs[i]; },
      nDsts, [=]__device__(int i) { return dstPtrs[i]; }, nElts);

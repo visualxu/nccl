@@ -18,11 +18,14 @@ namespace {
     ssize_t chunkCount = args->chunkCount;
     const int nranks = ncclShmem.comm.nRanks;
     const ssize_t loopCount = nranks * chunkCount;
+    const ssize_t overlapThreshold = loopCount * 2;
     ssize_t offset;
     ssize_t gridOffset = args->workOffset;
     ssize_t channelCount = args->workCount;
     int nelem;
     int chunk;
+    ssize_t offsetPre = 0;
+    int nelemPre = 0;
 
     Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0> prims
       (tid, nthreads, &ring->prev, &ring->next, args->sendbuff, args->recvbuff, args->redOpArg);
@@ -42,7 +45,11 @@ namespace {
       chunkOffset = chunk * chunkCount;
       offset = gridOffset + elemOffset + chunkOffset;
       nelem = (int)min(chunkCount, remCount - chunkOffset);
-      prims.send(offset, nelem);
+      if (elemOffset > 0 && nelemPre == nelem) {
+        prims.recvCopySendV2(offset, offsetPre, nelem);
+      } else {
+        prims.send(offset, nelem);
+      }
 
       // k-2 steps: reduce and copy to next GPU
       for (int j = 2; j < nranks; ++j) {
@@ -73,9 +80,12 @@ namespace {
       // Make final copy from buffer to dest.
       chunk = modRanks(ringIx + 1);
       chunkOffset = chunk * chunkCount;
-      offset = gridOffset + elemOffset + chunkOffset;
-      nelem = (int)min(chunkCount, remCount - chunkOffset);
-      prims.directRecv(offset, nelem);
+      offsetPre = gridOffset + elemOffset + chunkOffset;
+      nelemPre = (int)min(chunkCount, remCount - chunkOffset);
+      if (elemOffset + overlapThreshold >= channelCount || nelemPre <= 0) {
+        prims.directRecv(offsetPre, nelemPre);
+        nelemPre = -1;
+      }
     }
   }
 
