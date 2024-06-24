@@ -710,6 +710,51 @@ static ncclResult_t registerIntraNodeBuffers(
         INFO(NCCL_REG, "rank %d successfully registered collNet sendbuff %p (handle %p), sendbuff size %ld, recvbuff %p (handle %p), recvbuff size %ld", comm->rank, info->sendbuff, sendHandle, info->sendbuffSize, info->recvbuff, recvHandle, info->recvbuffSize);
       }
     }
+  } else if (info->algorithm == NCCL_ALGO_RING) {
+    fprintf(stderr, "ring register!!!!!!!\n");
+    int localRank = comm->localRank;
+    cudaPointerAttributes sattr, rattr;
+
+    CUDACHECK(cudaPointerGetAttributes(&sattr, info->sendbuff));
+    CUDACHECK(cudaPointerGetAttributes(&rattr, info->recvbuff));
+    if (sattr.type != cudaMemoryTypeDevice || rattr.type != cudaMemoryTypeDevice) return ncclSuccess;
+
+    if (CUPFN(cuMemGetAddressRange) == nullptr) return ncclSuccess;
+
+    struct HandlePair {
+      cudaIpcMemHandle_t ipc[2]; // {send, recv}
+      size_t offset[2]; // {send, recv}
+    };
+    struct HandlePair handles[NCCL_MAX_LOCAL_RANKS];
+
+    CUDACHECKGOTO(cudaIpcGetMemHandle(&handles[localRank].ipc[0], (void*)info->sendbuff), result, fallback);
+    CUDACHECKGOTO(cudaIpcGetMemHandle(&handles[localRank].ipc[1], (void*)info->recvbuff), result, fallback);
+
+    void *baseSend, *baseRecv;
+    size_t size;
+    CUCHECK(cuMemGetAddressRange((CUdeviceptr *)&baseSend, &size, (CUdeviceptr)info->sendbuff));
+    handles[localRank].offset[0] = (char*)info->sendbuff - (char*)baseSend;
+    CUCHECK(cuMemGetAddressRange((CUdeviceptr *)&baseRecv, &size, (CUdeviceptr)info->recvbuff));
+    handles[localRank].offset[1] = (char*)info->recvbuff - (char*)baseRecv;
+    NCCLCHECK(ncclShmemAllgather(comm, &comm->nvlsResources->nvlsShmem, handles + comm->localRank, handles, sizeof(struct HandlePair)));
+
+    // Open handles locally
+    for (int c=0; c < info->nChannels; c++) {
+      ncclRing& ring = info->comm->channels[c].ring;
+      int peer = info->comm->rankToLocalRank[ring.next];
+      for (int sr=0; sr < 2; sr++) {
+        // Get base address of mapping
+        void* base;
+        CUDACHECK(cudaIpcOpenMemHandle(&base, handles[peer].ipc[sr], cudaIpcMemLazyEnablePeerAccess));
+        // Get real buffer address by adding offset in the mapping
+        (sr == 0 ? info->regBufSend : info->regBufRecv)[c] = (char*)base + handles[peer].offset[sr];
+        // Enqueue reminder to close memory handle
+        struct ncclPointerList* q = ncclMemoryPoolAlloc<struct ncclPointerList>(&comm->memPool_ncclPointerList, &comm->memPermanent);
+        q->ptr = base;
+        ncclIntruQueueEnqueue(&plan->ipcMemQueue, q);
+      }
+    }
+    info->regBufType = NCCL_IPC_REG_BUFFER;
   }
 fallback:
 #endif
