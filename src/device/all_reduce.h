@@ -44,7 +44,7 @@ namespace {
       chunkOffset = chunk * chunkCount;
       offset = gridOffset + elemOffset + chunkOffset;
       nelem = (int)min(chunkCount, remCount - chunkOffset);
-      prims.directSend(offset, offset, nelem);
+      prims.send(offset, nelem);
 
       // k-2 steps: reduce and copy to next GPU
       for (int j = 2; j < nranks; ++j) {
@@ -52,7 +52,7 @@ namespace {
         chunkOffset = chunk * chunkCount;
         offset = gridOffset + elemOffset + chunkOffset;
         nelem = (int)min(chunkCount, remCount - chunkOffset);
-        prims.directRecvReduceDirectSend(offset, offset, nelem);
+        prims.recvReduceSend(offset, nelem);
       }
 
       // step k-1: reduce this buffer and data, which will produce the final
@@ -61,7 +61,7 @@ namespace {
       chunkOffset = chunk * chunkCount;
       offset = gridOffset + elemOffset + chunkOffset;
       nelem = (int)min(chunkCount, remCount - chunkOffset);
-      prims.directRecvReduceCopyDirectSend(offset, offset, nelem, /*postOp=*/true);
+      prims.recvReduceCopyDirectSend(offset, offset, nelem, /*postOp=*/true);
 
       // k-2 steps: copy to next GPU
       for (int j = 1; j < nranks - 1; ++j) {
