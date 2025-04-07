@@ -19,6 +19,13 @@ RDMA_CORE ?= 0
 NET_PROFILER ?= 0
 
 NVCC = $(CUDA_HOME)/bin/nvcc
+__AVX__ ?=
+ifeq ($(shell cat /proc/cpuinfo | grep flags | grep avx2 >& /dev/null; echo $$?), 0)
+__AVX__ = -mavx2
+endif
+ifeq ($(shell cat /proc/cpuinfo | grep flags | grep avx512f >& /dev/null; echo $$?), 0)
+__AVX__ = -mavx512f
+endif
 
 CUDA_LIB ?= $(CUDA_HOME)/lib64
 CUDA_INC ?= $(CUDA_HOME)/include
@@ -68,6 +75,7 @@ $(info NVCC_GENCODE is ${NVCC_GENCODE})
 
 CXXFLAGS   := -DCUDA_MAJOR=$(CUDA_MAJOR) -DCUDA_MINOR=$(CUDA_MINOR) -fPIC -fvisibility=hidden \
               -Wall -Wno-unused-function -Wno-sign-compare -std=c++11 -Wvla \
+	      $(__AVX__) \
               -I $(CUDA_INC) \
               $(CXXFLAGS)
 # Maxrregcount needs to be set accordingly to NCCL_MAX_NTHREADS (otherwise it will cause kernel launch errors)

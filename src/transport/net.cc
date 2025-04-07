@@ -16,6 +16,13 @@
 #include "transport.h"
 #include "shm.h"
 #include <assert.h>
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#define HAS_AVX512 1
+#elif defined(__AVX__)
+#include <immintrin.h>
+#define HAS_AVX 1
+#endif
 
 static_assert(sizeof(ncclNetHandle_t) <= CONNECT_SIZE, "NET Connect info is too large");
 
@@ -1173,10 +1180,30 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
             uint32_t flag = NCCL_LL_FLAG(sub->base+sub->transmitted+1);
             int nFifoLines = DIVUP(size, sizeof(union ncclLLFifoLine));
             union ncclLLFifoLine* lines = (union ncclLLFifoLine*)buff;
+#ifdef HAS_AVX512
+            // AVX512 version
+            __m512i vecB = _mm512_set1_epi64((uint64_t)flag << 32);
+            for (int i=0; i<nFifoLines; i+=(64/sizeof(ncclLLFifoLine))) {
+              __m512i vecA = _mm512_stream_load_si512(lines+i);
+              __m512i maskA = _mm512_and_epi64(vecA, _mm512_set1_epi64(0xffffffff00000000));
+              __mmask8 result = _mm512_cmpeq_epi64_mask(maskA, vecB);
+              auto c = __builtin_popcount(static_cast<uint16_t>(result));
+              if (c != 8) { ready = 0; break;}
+#elif defined(HAS_AVX)
+            // AVX256 version
+            __m256i vecB = _mm256_set1_epi64x((uint64_t)flag << 32);
+            for (int i=0; i<nFifoLines; i+=(32/sizeof(ncclLLFifoLine))) {
+              __m256i vecA = _mm256_stream_load_si256((__m256i*)(lines+i));
+              __m256i maskA = _mm256_and_si256(vecA, _mm256_set1_epi64x(0xffffffff00000000));
+              __m256i result = _mm256_cmpeq_epi64(maskA, vecB);
+              auto c = __builtin_popcount(_mm256_movemask_epi8(result));
+              if (c != 32) { ready = 0; break;}
+#else
             for (int i=0; i<nFifoLines; i++) {
               volatile uint32_t *f1 = &lines[i].flag1;
               volatile uint32_t *f2 = &lines[i].flag2;
               if (f1[0] != flag || f2[0] != flag) { ready = 0; break; }
+#endif
             }
           } else if (p == NCCL_PROTO_SIMPLE) {
             if (resources->shared) {
